@@ -19,6 +19,7 @@
  */
 import { getChannelAdapter } from './channels/channel-registry.js';
 import { gateCommand } from './command-gate.js';
+import { gateOwnerVerify } from './owner-verify-gate.js';
 import { namespaceMessageIdForAgent } from './message-id.js';
 import { getAgentGroup } from './db/agent-groups.js';
 import { recordDroppedMessage } from './db/dropped-messages.js';
@@ -443,6 +444,26 @@ async function deliverToAgent(
     platformId: event.platformId,
     threadId: event.threadId,
   };
+
+  // Owner verification gate: `/verify <code>` is checked against the enrolled
+  // authenticator here, on the host. The code never reaches a container; on
+  // success the host signs an attestation, which is how the result reaches the
+  // agent in a form it cannot forge. Runs before the command gate so a
+  // verification attempt is never treated as an ordinary message.
+  if (event.message.kind === 'chat' || event.message.kind === 'chat-sdk') {
+    const verifyGate = gateOwnerVerify(event.message.content, userId);
+    if (verifyGate.action === 'handled') {
+      writeOutboundDirect(session.agent_group_id, session.id, {
+        id: `verify-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+        kind: 'chat',
+        platformId: deliveryAddr.platformId,
+        channelType: deliveryAddr.channelType,
+        threadId: deliveryAddr.threadId,
+        content: JSON.stringify({ text: verifyGate.reply }),
+      });
+      return;
+    }
+  }
 
   // Command gate: classify slash commands before they reach the container.
   // Filtered commands are dropped silently. Denied admin commands get a

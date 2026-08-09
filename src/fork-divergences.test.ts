@@ -123,3 +123,52 @@ describe('fork divergence: OneGate proxy switch (structural)', () => {
     expect(src).toContain('export function applyDirectContainerConfig');
   });
 });
+
+describe('fork divergence: owner verification gate (structural)', () => {
+  // `/verify <code>` must be intercepted in the router, on the host. If an
+  // upstream merge drops the hook, the command stops being handled and the
+  // literal text "/verify 123456" is forwarded to the container — leaking a
+  // live TOTP code into an agent context and silently disabling owner
+  // authentication. Nothing else fails: the build is clean and every other
+  // test passes, which is exactly why this guard exists.
+
+  it('wires the verify gate into the router', () => {
+    const src = readSource('src', 'router.ts');
+    expect(src).toContain("from './owner-verify-gate.js'");
+    expect(src).toContain('gateOwnerVerify(');
+  });
+
+  it('runs the verify gate BEFORE the ordinary command gate', () => {
+    // Otherwise a /verify message could be classified and forwarded as a
+    // normal message before the code is ever checked.
+    const src = readSource('src', 'router.ts');
+    const verifyAt = src.indexOf('gateOwnerVerify(');
+    const commandAt = src.indexOf('gateCommand(');
+    expect(verifyAt).toBeGreaterThan(-1);
+    expect(commandAt).toBeGreaterThan(-1);
+    expect(verifyAt).toBeLessThan(commandAt);
+  });
+
+  it('never forwards a verify attempt to the container', () => {
+    // The handled branch must return, not fall through to writeSessionMessage.
+    const src = readSource('src', 'owner-verify-gate.ts');
+    expect(src).toContain("action: 'handled'");
+    // A failed check is still handled — a wrong code must not reach the agent.
+    // Match the message text rather than a formatting-dependent property
+    // shape; prettier rewrites the surrounding assignment into a ternary.
+    expect(src).toContain('Verification failed.');
+  });
+
+  it('keeps the attestation primitives fork-only but intact', () => {
+    const attest = readSource('src', 'attest.ts');
+    expect(attest).toContain('export function signAttestation');
+    expect(attest).toContain('export function verifyAttestation');
+    // The private key must never be inside the mounted directory.
+    expect(attest).toContain(".config', 'nanoclaw', 'attest-ed25519.key'");
+
+    const totp = readSource('src', 'owner-totp.ts');
+    expect(totp).toContain('export function verifyCode');
+    // Replay protection is load-bearing: codes travel over the chat channel.
+    expect(totp).toContain("reason: 'replayed'");
+  });
+});
