@@ -10,7 +10,12 @@ import fs from 'fs';
 import path from 'path';
 import { describe, it, expect, afterEach } from 'vitest';
 
-import { getInboundSourceSessionId, migrateMessagesInTable } from './session-db.js';
+import {
+  getInboundSourceSessionId,
+  isTransientMountError,
+  migrateMessagesInTable,
+  withMountRetry,
+} from './session-db.js';
 
 const TEST_DIR = '/tmp/nanoclaw-session-db-test';
 const DB_PATH = path.join(TEST_DIR, 'inbound.db');
@@ -90,5 +95,67 @@ describe('migrateMessagesInTable', () => {
     expect(getInboundSourceSessionId(db, 'legacy-2')).toBeNull();
     expect(getInboundSourceSessionId(db, 'does-not-exist')).toBeNull();
     db.close();
+  });
+});
+
+describe('isTransientMountError', () => {
+  it('matches a read that raced a write on the other side of the mount', () => {
+    // The host reads outbound.db read-only while the container writes it.
+    // A read landing mid-write hits the container's hot rollback journal;
+    // this used to abort the delivery poll and strand the messages.
+    expect(isTransientMountError('attempt to write a readonly database')).toBe(true);
+    expect(isTransientMountError('SqliteError: SQLITE_READONLY_ROLLBACK')).toBe(true);
+    expect(isTransientMountError('database disk image is malformed')).toBe(true);
+    expect(isTransientMountError('SQLITE_CORRUPT_VTAB')).toBe(true);
+    expect(isTransientMountError('file is not a database')).toBe(true);
+  });
+
+  it('does not claim lock contention or real schema errors', () => {
+    expect(isTransientMountError('database is locked')).toBe(false);
+    expect(isTransientMountError('no such table: messages_out')).toBe(false);
+    expect(isTransientMountError('')).toBe(false);
+  });
+});
+
+describe('withMountRetry', () => {
+  it('returns the value when the read succeeds first time', () => {
+    expect(withMountRetry(() => 'value')).toBe('value');
+  });
+
+  it('retries a transient mount fault until it clears', () => {
+    let calls = 0;
+    const result = withMountRetry(() => {
+      calls += 1;
+      if (calls < 4) throw new Error('attempt to write a readonly database');
+      return calls;
+    });
+    expect(result).toBe(4);
+  });
+
+  it('surfaces a non-mount error immediately without retrying', () => {
+    let calls = 0;
+    expect(() =>
+      withMountRetry(() => {
+        calls += 1;
+        throw new Error('no such table: messages_out');
+      }),
+    ).toThrow('no such table');
+    expect(calls).toBe(1);
+  });
+
+  it('gives up after a bounded number of attempts and keeps the cause', () => {
+    let calls = 0;
+    let caught: unknown;
+    try {
+      withMountRetry(() => {
+        calls += 1;
+        throw new Error('database disk image is malformed');
+      });
+    } catch (err) {
+      caught = err;
+    }
+    expect(calls).toBe(12);
+    expect((caught as Error).message).toContain('after 12 attempts');
+    expect((caught as Error).cause).toBeInstanceOf(Error);
   });
 });

@@ -9,6 +9,67 @@ import Database from 'better-sqlite3';
 
 import { INBOUND_SCHEMA, OUTBOUND_SCHEMA } from './schema.js';
 
+/**
+ * SQLite errors that mean "this read raced a write on the other side of the
+ * container mount", not "this file is damaged".
+ *
+ * The host reads outbound.db read-only while the container is its sole writer.
+ * When a read lands mid-write, SQLite either finds a hot rollback journal it
+ * cannot replay through a read-only handle (`attempt to write a readonly
+ * database`) or latches a torn page snapshot (`database disk image is
+ * malformed`). Both clear on a retry with a fresh connection; the file's
+ * integrity_check passes throughout.
+ *
+ * Mirrors isTransientMountError() in container/agent-runner/src/db/connection.ts
+ * — the same fault, seen from the other side of the mount. The two trees share
+ * no modules by design, so this duplication is deliberate.
+ */
+export function isTransientMountError(msg: string): boolean {
+  return (
+    msg.includes('attempt to write a readonly database') ||
+    msg.includes('SQLITE_READONLY') ||
+    msg.includes('database disk image is malformed') ||
+    msg.includes('SQLITE_CORRUPT') ||
+    msg.includes('file is not a database')
+  );
+}
+
+/** Attempts before a cross-mount read is treated as a real failure. */
+const MOUNT_READ_ATTEMPTS = 12;
+
+/**
+ * Run a cross-mount read, retrying transient mount faults.
+ *
+ * `fn` must open its own connection and close it on the failure path — the
+ * fault lives in the connection's view of the file, so reusing a handle that
+ * already failed just reproduces it.
+ */
+export function withMountRetry<T>(fn: () => T): T {
+  let lastErr: unknown;
+  for (let attempt = 1; attempt <= MOUNT_READ_ATTEMPTS; attempt++) {
+    try {
+      return fn();
+    } catch (err) {
+      lastErr = err;
+      const msg = err instanceof Error ? err.message : String(err);
+      if (!isTransientMountError(msg)) throw err;
+      if (attempt < MOUNT_READ_ATTEMPTS) {
+        // Spin briefly rather than await — callers are sync and the observed
+        // window is sub-millisecond. Worst case ~60ms across all attempts.
+        const until = Date.now() + Math.min(attempt * 5, 25);
+        while (Date.now() < until) {
+          /* wait out the host-side write */
+        }
+      }
+    }
+  }
+  throw new Error(
+    `session DB unreadable across the container mount after ${MOUNT_READ_ATTEMPTS} attempts: ` +
+      `${lastErr instanceof Error ? lastErr.message : String(lastErr)}`,
+    { cause: lastErr },
+  );
+}
+
 /** Apply the inbound or outbound schema to a DB file. Idempotent. */
 export function ensureSchema(dbPath: string, schema: 'inbound' | 'outbound'): void {
   const db = new Database(dbPath);

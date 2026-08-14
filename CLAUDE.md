@@ -88,6 +88,8 @@ Each session has **two** SQLite files under `data/v2-sessions/<session_id>/`:
 
 Exactly one writer per file — no cross-mount lock contention. Heartbeat is a file touch at `/workspace/.heartbeat`, not a DB update. Host uses even `seq` numbers, container uses odd.
 
+One writer per file removes lock contention but not read/write races: a reader on one side of the mount can still catch the other side mid-write and get a transient SQLite error. Every cross-mount read must go through the retry helpers — see the gotcha under [Container Runtime (Bun)](#container-runtime-bun).
+
 ## Central DB
 
 `data/v2.db` holds everything that isn't per-session: users, user_roles, agent_groups, messaging_groups, wiring, pending_approvals, user_dms, chat_sdk_* (for the Chat SDK bridge), schema_version. Migrations live at `src/db/migrations/`.
@@ -389,6 +391,7 @@ The agent container runs on **Bun**; the host runs on **Node** (pnpm). They comm
 - **Adding a Node CLI the agent invokes at runtime** (like `agent-browser`, `claude-code`, `vercel`) → put it in the Dockerfile's pnpm global-install block, pinned to an exact version via a new `ARG`. Don't use `bun install -g` — that bypasses the pnpm supply-chain policy.
 - **Changing the Dockerfile entrypoint or the dynamic-spawn command** (the `exec bun run /app/src/index.ts` arg in `src/container-runner.ts`) → keep `exec bun ...` so signals forward cleanly. The image has no `/app/dist`; don't reintroduce a tsc build step.
 - **Changing session-DB pragmas** (`container/agent-runner/src/db/connection.ts`) → `journal_mode=DELETE` is load-bearing for cross-mount visibility. Read the comment block at the top of the file first.
+- **Reading a session DB from the other side of the container mount** → go through `withInboundDb()` (container, `db/connection.ts`) or `withMountRetry()` (host, `src/db/session-db.ts`). Never open-and-read a cross-mount DB directly. A read that lands mid-write on the other side fails — usually `attempt to write a readonly database` (SQLite finds a hot rollback journal it can't replay through a read-only handle), sometimes `database disk image is malformed`. The file is fine; `integrity_check` passes throughout, and a retry on a fresh connection clears it every time. Measured on Docker Desktop macOS at ~40 host writes/sec: 947 failures in 8213 reads, 100% recovered, worst case 6 attempts. Unguarded, these were fatal — they crash-looped the container ~24×/day and aborted delivery polls.
 
 ## CJK font support
 

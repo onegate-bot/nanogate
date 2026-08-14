@@ -5,7 +5,7 @@
  * Scheduling operations are sent as system actions via messages_out — the host
  * reads them during delivery and applies the changes to inbound.db.
  */
-import { getInboundDb } from '../db/connection.js';
+import { withInboundDb } from '../db/connection.js';
 import { writeMessageOut } from '../db/messages-out.js';
 import { getSessionRouting } from '../db/session-routing.js';
 import { TIMEZONE, parseZonedToUtc } from '../timezone.js';
@@ -114,7 +114,6 @@ export const listTasks: McpToolDefinition = {
   },
   async handler(args) {
     const status = args.status as string | undefined;
-    const db = getInboundDb();
     // One row per series — the live (pending or paused) occurrence. Recurring
     // tasks accumulate one completed row per firing plus one live follow-up;
     // exposing the whole pile to the agent is noisy and confuses task identity
@@ -123,28 +122,27 @@ export const listTasks: McpToolDefinition = {
     // SQLite quirk: when MAX(seq) appears in the SELECT list of a GROUP BY
     // query, the bare columns take values from the row that contains that max
     // — that's how we pick "the latest live row per series" in one pass.
-    let rows;
-    if (status) {
-      rows = db
-        .prepare(
-          `SELECT series_id AS id, status, process_after, recurrence, content, MAX(seq) AS _seq
+    const rows = withInboundDb((db) =>
+      status
+        ? db
+            .prepare(
+              `SELECT series_id AS id, status, process_after, recurrence, content, MAX(seq) AS _seq
              FROM messages_in
             WHERE kind = 'task' AND status = ?
             GROUP BY series_id
             ORDER BY process_after ASC`,
-        )
-        .all(status);
-    } else {
-      rows = db
-        .prepare(
-          `SELECT series_id AS id, status, process_after, recurrence, content, MAX(seq) AS _seq
+            )
+            .all(status)
+        : db
+            .prepare(
+              `SELECT series_id AS id, status, process_after, recurrence, content, MAX(seq) AS _seq
              FROM messages_in
             WHERE kind = 'task' AND status IN ('pending', 'paused')
             GROUP BY series_id
             ORDER BY process_after ASC`,
-        )
-        .all();
-    }
+            )
+            .all(),
+    );
 
     if ((rows as unknown[]).length === 0) return ok('No tasks found.');
 

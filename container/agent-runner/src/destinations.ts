@@ -10,7 +10,7 @@
  * The host re-validates on the delivery side against the central DB,
  * so even if this table is stale the host's enforcement is authoritative.
  */
-import { getInboundDb } from './db/connection.js';
+import { withInboundDb } from './db/connection.js';
 
 export interface DestinationEntry {
   name: string;
@@ -42,12 +42,14 @@ function rowToEntry(row: DestRow): DestinationEntry {
 }
 
 export function getAllDestinations(): DestinationEntry[] {
-  const rows = getInboundDb().prepare('SELECT * FROM destinations ORDER BY name').all() as DestRow[];
+  const rows = withInboundDb((db) => db.prepare('SELECT * FROM destinations ORDER BY name').all() as DestRow[]);
   return rows.map(rowToEntry);
 }
 
 export function findByName(name: string): DestinationEntry | undefined {
-  const row = getInboundDb().prepare('SELECT * FROM destinations WHERE name = ?').get(name) as DestRow | undefined;
+  const row = withInboundDb(
+    (db) => db.prepare('SELECT * FROM destinations WHERE name = ?').get(name) as DestRow | undefined,
+  );
   return row ? rowToEntry(row) : undefined;
 }
 
@@ -60,15 +62,15 @@ export function findByRouting(
   platformId: string | null | undefined,
 ): DestinationEntry | undefined {
   if (!channelType || !platformId) return undefined;
-  const db = getInboundDb();
-  const row =
+  const row = withInboundDb((db) =>
     channelType === 'agent'
       ? (db
           .prepare("SELECT * FROM destinations WHERE type = 'agent' AND agent_group_id = ?")
           .get(platformId) as DestRow | undefined)
       : (db
           .prepare("SELECT * FROM destinations WHERE type = 'channel' AND channel_type = ? AND platform_id = ?")
-          .get(channelType, platformId) as DestRow | undefined);
+          .get(channelType, platformId) as DestRow | undefined),
+  );
   return row ? rowToEntry(row) : undefined;
 }
 

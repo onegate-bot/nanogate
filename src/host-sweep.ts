@@ -41,6 +41,7 @@ import {
   markMessageFailed,
   retryWithBackoff,
   syncProcessingAcks,
+  withMountRetry,
   type ContainerState,
 } from './db/session-db.js';
 import { log } from './log.js';
@@ -146,7 +147,14 @@ async function sweep(): Promise<void> {
   try {
     const sessions = getActiveSessions();
     for (const session of sessions) {
-      await sweepSession(session);
+      // Isolate per session: a single session's failure used to abort the
+      // whole loop, so every session after it silently lost its tick —
+      // no ack sync, no wake, no stuck-container detection.
+      try {
+        await sweepSession(session);
+      } catch (err) {
+        log.error('Session sweep error', { sessionId: session.id, err });
+      }
     }
   } catch (err) {
     log.error('Host sweep error', { err });
@@ -183,7 +191,20 @@ async function sweepSession(session: Session): Promise<void> {
   }
 
   try {
-    outDb = openOutboundDb(agentGroup.id, session.id);
+    // The container is outbound.db's sole writer, so opening it can race a
+    // write. Probe with a real read inside the retry: the fault surfaces on
+    // first access, and retrying there gets us a connection whose view is
+    // clean for the reads that follow.
+    outDb = withMountRetry(() => {
+      const db = openOutboundDb(agentGroup.id, session.id);
+      try {
+        db.prepare('SELECT 1 FROM processing_ack LIMIT 1').get();
+        return db;
+      } catch (err) {
+        db.close();
+        throw err;
+      }
+    });
   } catch {
     // outbound.db might not exist yet (container hasn't started)
   }

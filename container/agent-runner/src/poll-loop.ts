@@ -1,7 +1,7 @@
 import { findByName, getAllDestinations, type DestinationEntry } from './destinations.js';
 import { getPendingMessages, markProcessing, markCompleted, type MessageInRow } from './db/messages-in.js';
 import { writeMessageOut } from './db/messages-out.js';
-import { getInboundDb, touchHeartbeat, clearStaleProcessingAcks } from './db/connection.js';
+import { withInboundDb, touchHeartbeat, clearStaleProcessingAcks, isTransientMountError } from './db/connection.js';
 import {
   clearContinuation,
   clearCurrentInReplyTo,
@@ -25,27 +25,30 @@ const POLL_INTERVAL_MS = 1000;
 const ACTIVE_POLL_INTERVAL_MS = 500;
 
 /**
- * Number of consecutive `database disk image is malformed` errors after which
- * the follow-up poll gives up and exits the process. At ACTIVE_POLL_INTERVAL_MS
- * = 500ms this is roughly 5 seconds — long enough to dodge a transient torn
- * read during a host write, short enough to recover quickly from a poisoned
- * page cache (host-sweep then respawns with a fresh mount).
+ * Number of consecutive cross-mount read failures that survive
+ * withInboundDb()'s own retries before the poll loop gives up and exits.
+ *
+ * withInboundDb() already retries each read up to 12 times with a fresh
+ * connection, which empirically clears 100% of these. Reaching this counter
+ * therefore means something is wrong beyond normal mount flakiness (a real
+ * damaged file, a vanished mount), so exiting for a fresh container is the
+ * right escalation — but it should now be vanishingly rare rather than the
+ * routine restart path it used to be.
  */
 const CORRUPTION_STREAK_EXIT = 10;
 
 /**
- * True for SQLite errors that indicate a corrupt READ view — almost always a
- * cross-mount page-cache coherency issue on Docker Desktop macOS rather than
- * actual file damage (host-side integrity_check passes). Reopening the DB
- * handle inside this process does NOT recover; only a fresh container mount
- * does. Caller's job is to exit so host-sweep respawns the container.
+ * True for SQLite errors caused by reading a session DB across the
+ * host↔container mount while the host is mid-write, rather than by real file
+ * damage (host-side integrity_check passes throughout).
+ *
+ * Retrying with a fresh connection recovers from every one of these — see the
+ * measurement in db/connection.ts. Prefer withInboundDb(), which handles the
+ * retry for you; this predicate is for callers that need to classify an error
+ * that already escaped.
  */
 export function isCorruptionError(msg: string): boolean {
-  return (
-    msg.includes('database disk image is malformed') ||
-    msg.includes('SQLITE_CORRUPT') ||
-    msg.includes('file is not a database')
-  );
+  return isTransientMountError(msg);
 }
 
 function log(msg: string): void {
@@ -117,10 +120,37 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
 
   let pollCount = 0;
   let isFirstPoll = true;
+  let mainCorruptionStreak = 0;
   while (true) {
     if (config.signal?.aborted) return;
+
     // Skip system messages — they're responses for MCP tools (e.g., ask_user_question)
-    const messages = getPendingMessages(isFirstPoll).filter((m) => m.kind !== 'system');
+    //
+    // This read must never take the container down on its own. It used to:
+    // getPendingMessages() was unguarded, so a single transient cross-mount
+    // failure (overwhelmingly `attempt to write a readonly database` — SQLite
+    // hitting the host's hot rollback journal mid-write) propagated out of the
+    // loop as a fatal error and killed the container, which then had to cold
+    // start. withInboundDb() now absorbs those; this guard is the backstop for
+    // the case where even the retries can't get a clean read.
+    let messages: MessageInRow[];
+    try {
+      messages = getPendingMessages(isFirstPoll).filter((m) => m.kind !== 'system');
+      mainCorruptionStreak = 0;
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      if (!isCorruptionError(errMsg)) throw err;
+      mainCorruptionStreak += 1;
+      log(`Poll read failed (${mainCorruptionStreak}/${CORRUPTION_STREAK_EXIT}): ${errMsg}`);
+      if (mainCorruptionStreak >= CORRUPTION_STREAK_EXIT) {
+        log(`inbound.db unreadable after ${mainCorruptionStreak} rounds of retries — exiting for a fresh mount.`);
+        // Defer so the log line flushes through Docker's log driver first.
+        setTimeout(() => process.exit(75), 100);
+        return;
+      }
+      await sleep(POLL_INTERVAL_MS);
+      continue;
+    }
     isFirstPoll = false;
     pollCount++;
 
@@ -434,12 +464,10 @@ export async function processQuery(
         const errMsg = err instanceof Error ? err.message : String(err);
         log(`Follow-up poll error: ${errMsg}`);
 
-        // Detect SQLite cross-mount corruption (Docker Desktop macOS virtiofs /
-        // gRPC-FUSE coherency bug — the kernel page cache for the inbound.db
-        // bind mount can latch a torn snapshot mid-host-write, after which
-        // every fresh openInboundDb() in this process sees the same broken
-        // view. Reopening inside the container does NOT recover; only a fresh
-        // container mount does. Exit so the host sweep respawns us.
+        // A cross-mount read error that survived withInboundDb()'s retries.
+        // Normal mount flakiness never gets this far, so a sustained streak
+        // means the file or the mount itself is genuinely broken — exit and
+        // let the host sweep respawn us with a fresh mount.
         if (isCorruptionError(errMsg)) {
           corruptionStreak += 1;
           if (corruptionStreak >= CORRUPTION_STREAK_EXIT) {
@@ -675,14 +703,16 @@ function resolveDestinationThread(
   platformId: string,
 ): { threadId: string | null; inReplyTo: string | null } | null {
   try {
-    const db = getInboundDb();
-    const row = db
-      .prepare(
-        `SELECT thread_id, id FROM messages_in
+    const row = withInboundDb(
+      (db) =>
+        db
+          .prepare(
+            `SELECT thread_id, id FROM messages_in
          WHERE channel_type = ? AND platform_id = ?
          ORDER BY seq DESC LIMIT 1`,
-      )
-      .get(channelType, platformId) as { thread_id: string | null; id: string } | undefined;
+          )
+          .get(channelType, platformId) as { thread_id: string | null; id: string } | undefined,
+    );
     if (row) return { threadId: row.thread_id, inReplyTo: row.id };
   } catch (err) {
     log(`resolveDestinationThread error: ${err instanceof Error ? err.message : String(err)}`);

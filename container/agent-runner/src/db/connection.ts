@@ -30,6 +30,44 @@ let _heartbeatPath: string = DEFAULT_HEARTBEAT_PATH;
 let _testMode = false;
 
 /**
+ * SQLite errors that are transient artifacts of reading inbound.db across the
+ * host↔container bind mount while the host is mid-write — not file damage.
+ *
+ * Two shapes, one cause:
+ *
+ *   - `attempt to write a readonly database` — SQLite opened the file, found a
+ *     hot rollback journal (the host is mid-transaction; inbound.db is
+ *     journal_mode=DELETE) and must roll it back to produce a consistent view.
+ *     Our handle is read-only, so it can't, and fails SQLITE_READONLY_ROLLBACK.
+ *     This is by far the most common one.
+ *   - `database disk image is malformed` / SQLITE_CORRUPT / `file is not a
+ *     database` — the guest latched a torn page snapshot mid-host-write.
+ *
+ * Both clear on retry with a fresh connection. Measured on Docker Desktop
+ * macOS (virtiofs) under a 40 writes/sec host load: 947 failures across 8213
+ * reads, *every one* recovered, worst case 6 attempts, and the file's
+ * integrity_check stayed `ok` throughout — see scripts/sanity-live-poll.ts for
+ * the visibility counterpart to this measurement.
+ */
+export function isTransientMountError(msg: string): boolean {
+  return (
+    msg.includes('attempt to write a readonly database') ||
+    msg.includes('SQLITE_READONLY') ||
+    msg.includes('database disk image is malformed') ||
+    msg.includes('SQLITE_CORRUPT') ||
+    msg.includes('file is not a database')
+  );
+}
+
+/**
+ * Attempts before giving up on a cross-mount read. The worst case observed
+ * empirically was 6; 12 leaves generous headroom under heavier host load
+ * while still failing fast enough that a genuinely damaged file surfaces
+ * within a couple of seconds rather than hanging the poll loop.
+ */
+const INBOUND_READ_ATTEMPTS = 12;
+
+/**
  * Avoid all cached db reads; open inbound.db read-only with mmap and page cache disabled.
  *
  * Use this (not getInboundDb) for readers that need to see host-written rows
@@ -61,10 +99,50 @@ export function openInboundDb(): Database {
 }
 
 /**
- * Inbound DB — long-lived singleton, OK for tables the host writes once
- * at spawn and never again (destinations, session_routing). For
- * messages_in polling — where the host writes continuously and a stale
- * view causes the pollHandle hang — use `openInboundDb()` instead.
+ * Run a read against inbound.db, retrying transient cross-mount failures with
+ * a *fresh* connection each attempt.
+ *
+ * Every inbound reader must go through this rather than calling
+ * openInboundDb() directly. The host writes inbound.db continuously (message
+ * routing, recurrence inserts, ack sync), so any read can land mid-write and
+ * fail — and each such failure used to propagate out of the poll loop and kill
+ * the container. Reopening is what clears it: the failure is tied to the
+ * connection's view of the file, not to the file itself.
+ *
+ * `fn` must not have side effects outside the DB — it can run more than once.
+ */
+export function withInboundDb<T>(fn: (db: Database) => T): T {
+  let lastErr: unknown;
+  for (let attempt = 1; attempt <= INBOUND_READ_ATTEMPTS; attempt++) {
+    const db = openInboundDb();
+    try {
+      return fn(db);
+    } catch (err) {
+      lastErr = err;
+      const msg = err instanceof Error ? err.message : String(err);
+      if (!isTransientMountError(msg)) throw err;
+      // Brief, mildly increasing pause so a longer host write can drain.
+      // Sync because every caller is sync; worst case is ~60ms of blocking.
+      if (attempt < INBOUND_READ_ATTEMPTS) Bun.sleepSync(Math.min(attempt * 5, 25));
+    } finally {
+      db.close();
+    }
+  }
+  throw new Error(
+    `inbound.db unreadable after ${INBOUND_READ_ATTEMPTS} attempts: ` +
+      `${lastErr instanceof Error ? lastErr.message : String(lastErr)}`,
+    { cause: lastErr },
+  );
+}
+
+/**
+ * Inbound DB — long-lived singleton. No production caller left: a cached
+ * handle can't be reopened, so it can neither refresh a stale view nor
+ * recover from a mid-write read fault, and every reader that used it could
+ * be killed by one. Use `withInboundDb()` instead — it is the only supported
+ * way to read inbound.db.
+ *
+ * Retained because the test harness seeds the in-memory DB through it.
  */
 export function getInboundDb(): Database {
   if (!_inbound) {

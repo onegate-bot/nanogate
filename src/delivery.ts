@@ -19,6 +19,7 @@ import {
   markDelivered,
   markDeliveryFailed,
   migrateDeliveredTable,
+  withMountRetry,
 } from './db/session-db.js';
 import { log } from './log.js';
 import { platformMessageIdFromAgentId } from './message-id.js';
@@ -169,18 +170,39 @@ async function drainSession(session: Session): Promise<void> {
   const agentGroup = getAgentGroup(session.agent_group_id);
   if (!agentGroup) return;
 
-  let outDb: Database.Database;
   let inDb: Database.Database;
   try {
-    outDb = openOutboundDb(agentGroup.id, session.id);
     inDb = openInboundDb(agentGroup.id, session.id);
   } catch {
     return; // DBs might not exist yet
   }
 
   try {
-    // Read all due messages from outbound.db (read-only)
-    const allDue = getDueOutboundMessages(outDb);
+    // Read all due messages from outbound.db (read-only). The container is
+    // this file's sole writer, so a poll can land mid-write and fail — open,
+    // read and close inside the retry so each attempt gets a clean view.
+    // Without the retry a single mid-write poll aborted the whole drain and
+    // the messages sat undelivered until the next tick.
+    let allDue: ReturnType<typeof getDueOutboundMessages>;
+    try {
+      allDue = withMountRetry(() => {
+        const outDb = openOutboundDb(agentGroup.id, session.id);
+        try {
+          return getDueOutboundMessages(outDb);
+        } finally {
+          outDb.close();
+        }
+      });
+    } catch (err) {
+      // A missing outbound.db is normal — the container may not have started
+      // yet. Anything else means the retries were exhausted, which is the
+      // failure this whole path exists to prevent; say so rather than
+      // returning quietly and looking like an idle session.
+      if (!(err instanceof Error && 'code' in err && err.code === 'SQLITE_CANTOPEN')) {
+        log.error('Could not read outbound.db for delivery', { sessionId: session.id, err });
+      }
+      return;
+    }
     if (allDue.length === 0) return;
 
     // Filter out already-delivered messages using inbound.db's delivered table
@@ -230,7 +252,6 @@ async function drainSession(session: Session): Promise<void> {
       }
     }
   } finally {
-    outDb.close();
     inDb.close();
   }
 }

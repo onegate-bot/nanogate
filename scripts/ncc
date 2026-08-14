@@ -17,6 +17,7 @@ import glob
 import json
 import os
 import platform
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -519,6 +520,28 @@ def cmd_health(args):
         h.add("WARN", "message delivery", f"{delerr} permanent failure(s) in recent error log")
     else:
         h.add("OK", "message delivery (no recent permanent failures)")
+
+    # 7b. container restart churn
+    #
+    # A crash-looping container is invisible to every other check here: the
+    # host respawns it, so the service is up, the heartbeat is fresh, and
+    # delivery eventually succeeds. The only symptom is the restart rate
+    # itself. Container names carry their spawn time as epoch ms, so counting
+    # distinct recent ones in the error log gives the rate directly.
+    now_ms = time.time() * 1000
+    spawns = set()
+    for m in re.finditer(r"nanoclaw-v2-[a-z0-9-]+?-(\d{13})", _tail(ERROR_LOG)):
+        ts = int(m.group(1))
+        if now_ms - ts <= 24 * 3600 * 1000:
+            spawns.add(ts)
+    restarts = len(spawns)
+    if restarts >= 12:
+        h.add("WARN", "container restarts",
+              f"{restarts} non-zero container exits in 24h — crash loop, check {ERROR_LOG}")
+    elif restarts >= 4:
+        h.add("WARN", "container restarts", f"{restarts} non-zero container exits in 24h")
+    else:
+        h.add("OK", f"container restarts ({restarts} in 24h)")
 
     # 8. overdue scheduled tasks
     overdue = 0

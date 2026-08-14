@@ -8,7 +8,7 @@
  * processing_ack. The host reads processing_ack to sync message lifecycle.
  */
 import { getConfig } from '../config.js';
-import { openInboundDb, getOutboundDb } from './connection.js';
+import { openInboundDb, getOutboundDb, withInboundDb } from './connection.js';
 
 // Cache whether inbound.db has the on_wake column (added in v2.0.48).
 // The container opens inbound.db read-only, so it can't ALTER —
@@ -63,12 +63,11 @@ function getMaxMessagesPerPrompt(): number {
  * trigger=1 separately (see src/db/session-db.ts).
  */
 export function getPendingMessages(isFirstPoll = false): MessageInRow[] {
-  const inbound = openInboundDb();
   const outbound = getOutboundDb();
 
-  try {
+  const pending = withInboundDb((inbound) => {
     const onWakeFilter = hasOnWakeColumn(inbound) ? 'AND (on_wake = 0 OR ?1 = 1)' : '';
-    const pending = inbound
+    return inbound
       .prepare(
         `SELECT * FROM messages_in
          WHERE status = 'pending'
@@ -78,22 +77,20 @@ export function getPendingMessages(isFirstPoll = false): MessageInRow[] {
          LIMIT ?2`,
       )
       .all(isFirstPoll ? 1 : 0, getMaxMessagesPerPrompt()) as MessageInRow[];
+  });
 
-    if (pending.length === 0) return [];
+  if (pending.length === 0) return [];
 
-    // Filter out messages already acknowledged in outbound.db
-    const ackedIds = new Set(
-      (outbound.prepare('SELECT message_id FROM processing_ack').all() as Array<{ message_id: string }>).map(
-        (r) => r.message_id,
-      ),
-    );
+  // Filter out messages already acknowledged in outbound.db
+  const ackedIds = new Set(
+    (outbound.prepare('SELECT message_id FROM processing_ack').all() as Array<{ message_id: string }>).map(
+      (r) => r.message_id,
+    ),
+  );
 
-    // Reverse: we fetched DESC to take the most recent N, but the agent
-    // should see them in chronological order (oldest first).
-    return pending.filter((m) => !ackedIds.has(m.id)).reverse();
-  } finally {
-    inbound.close();
-  }
+  // Reverse: we fetched DESC to take the most recent N, but the agent
+  // should see them in chronological order (oldest first).
+  return pending.filter((m) => !ackedIds.has(m.id)).reverse();
 }
 
 /** Mark messages as processing — writes to processing_ack in outbound.db. */
@@ -131,12 +128,9 @@ export function markFailed(id: string): void {
 
 /** Get a message by ID (read from inbound.db). */
 export function getMessageIn(id: string): MessageInRow | undefined {
-  const inbound = openInboundDb();
-  try {
-    return inbound.prepare('SELECT * FROM messages_in WHERE id = ?').get(id) as MessageInRow | undefined;
-  } finally {
-    inbound.close();
-  }
+  return withInboundDb(
+    (inbound) => inbound.prepare('SELECT * FROM messages_in WHERE id = ?').get(id) as MessageInRow | undefined,
+  );
 }
 
 /**
@@ -144,22 +138,20 @@ export function getMessageIn(id: string): MessageInRow | undefined {
  * Reads from inbound.db, checks processing_ack to skip already-handled responses.
  */
 export function findQuestionResponse(questionId: string): MessageInRow | undefined {
-  const inbound = openInboundDb();
   const outbound = getOutboundDb();
 
-  try {
-    const response = inbound
-      .prepare("SELECT * FROM messages_in WHERE status = 'pending' AND content LIKE ?")
-      .get(`%"questionId":"${questionId}"%`) as MessageInRow | undefined;
+  const response = withInboundDb(
+    (inbound) =>
+      inbound
+        .prepare("SELECT * FROM messages_in WHERE status = 'pending' AND content LIKE ?")
+        .get(`%"questionId":"${questionId}"%`) as MessageInRow | undefined,
+  );
 
-    if (!response) return undefined;
+  if (!response) return undefined;
 
-    // Check it hasn't been acked already
-    const acked = outbound.prepare('SELECT 1 FROM processing_ack WHERE message_id = ?').get(response.id);
-    if (acked) return undefined;
+  // Check it hasn't been acked already
+  const acked = outbound.prepare('SELECT 1 FROM processing_ack WHERE message_id = ?').get(response.id);
+  if (acked) return undefined;
 
-    return response;
-  } finally {
-    inbound.close();
-  }
+  return response;
 }

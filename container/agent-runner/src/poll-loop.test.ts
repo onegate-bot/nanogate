@@ -448,6 +448,10 @@ describe('isCorruptionError', () => {
     expect(isCorruptionError('file is not a database')).toBe(true);
   });
 
+  it('matches the hot-journal read fault that used to kill the container', () => {
+    expect(isCorruptionError('attempt to write a readonly database')).toBe(true);
+  });
+
   it('returns false for unrelated errors', () => {
     expect(isCorruptionError('database is locked')).toBe(false);
     expect(isCorruptionError('no such table: messages_in')).toBe(false);
