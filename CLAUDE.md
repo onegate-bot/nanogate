@@ -17,6 +17,22 @@ If you are a fresh install (you ran `git clone`, not `git pull`) and there are n
 
 Personal AI assistant. See [README.md](README.md) for philosophy and setup. Architecture lives in `docs/`.
 
+## Nanogate versioning
+
+This fork has its own version, separate from upstream's `package.json` version
+(which keeps tracking nanocoai/nanoclaw and must not be edited for fork releases).
+
+- The version lives in `NANOGATE_VERSION` at the repo root, `MAJOR.MINOR.PATCH`.
+- **Every merge to `main` bumps it** — patch for fixes, minor for features or a
+  routine upstream sync, major for breaking changes to how the fork is operated.
+  `.github/workflows/nanogate-version.yml` fails a PR to `main` whose
+  `NANOGATE_VERSION` is not strictly greater than `main`'s.
+- On push to `main` the same workflow creates the tag `nanogate-vX.Y.Z` and a
+  GitHub Release for it. Tags are prefixed because the repo also carries
+  upstream's `vX.Y.Z` tags, and a bare `v2.0.1` would read as an old nanoclaw.
+- History: `nanogate-v1.0.0` = `main` before the 2026-09-10 upstream sync
+  (commit 2ea7307b); that sync lands as `nanogate-v2.0.1`.
+
 ## ⚠️ Fork divergences — read before resolving any upstream merge conflict
 
 This fork intentionally differs from upstream `nanocoai/nanoclaw` in the files below.

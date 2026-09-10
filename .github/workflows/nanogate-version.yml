@@ -1,0 +1,59 @@
+# Fork-only. Upstream's release.yml refuses to run outside nanocoai/nanoclaw and
+# tags upstream's package.json version as vX.Y.Z; this fork versions itself
+# separately in NANOGATE_VERSION and tags nanogate-vX.Y.Z. See CLAUDE.md
+# "Nanogate versioning".
+name: nanogate version
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  bump-required:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: NANOGATE_VERSION must increase against the base branch
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          set -euo pipefail
+          head="$(tr -d '[:space:]' < NANOGATE_VERSION)"
+          base="$(git show "origin/${BASE_REF}:NANOGATE_VERSION" 2>/dev/null | tr -d '[:space:]' || true)"
+          base="${base:-0.0.0}"
+          for v in "$head" "$base"; do
+            [[ "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::'$v' is not MAJOR.MINOR.PATCH"; exit 1; }
+          done
+          highest="$(printf '%s\n%s\n' "$base" "$head" | sort -t. -k1,1n -k2,2n -k3,3n | tail -n1)"
+          if [ "$head" = "$base" ] || [ "$highest" != "$head" ]; then
+            echo "::error::NANOGATE_VERSION is $head but ${BASE_REF} is at $base. Every merge to main bumps major, minor or patch."
+            exit 1
+          fi
+          echo "NANOGATE_VERSION $base -> $head"
+
+  tag-release:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tag and release nanogate-v<NANOGATE_VERSION> if not yet released
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          v="$(tr -d '[:space:]' < NANOGATE_VERSION)"
+          tag="nanogate-v${v}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "$tag already released"; exit 0
+          fi
+          gh release create "$tag" --target "$GITHUB_SHA" --title "nanogate v${v}" --generate-notes
