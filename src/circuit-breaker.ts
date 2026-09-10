@@ -41,7 +41,7 @@ export function resetCircuitBreaker(): void {
     fs.unlinkSync(CB_PATH);
     log.info('Circuit breaker reset on clean shutdown');
   } catch {
-    // No breaker file to remove — nothing to reset.
+    // Missing/stale breaker state is already the reset state.
   }
 }
 
