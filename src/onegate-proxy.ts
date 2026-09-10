@@ -17,6 +17,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 
+import type { GatewayContribution } from './gateway-providers/gateway-provider-registry.js';
 import { log } from './log.js';
 
 const CFG_DIR = path.join(os.homedir(), '.nanoclaw-onegate');
@@ -88,11 +89,16 @@ function resolveClaudeGateToken(): { token: string; source: string } {
 }
 
 /**
- * Append OneGate proxy env + CA mount to `args`. Throws if the token or CA is
- * missing so we never silently spawn without credentials (parity with the
- * OneCLI path's hard-fail). The agent token is never logged.
+ * Build the OneGate proxy env + CA mount as a typed gateway contribution.
+ * Throws if the token or CA is missing so we never silently spawn without
+ * credentials (parity with the OneCLI path's hard-fail). The agent token is
+ * never logged.
  */
-export function applyOneGateContainerConfig(args: string[], opts: { agent?: string; containerName: string }): void {
+export function applyOneGateContainerConfig(opts: {
+  agent?: string;
+  containerName: string;
+  groupScope: string;
+}): GatewayContribution {
   const token = fs.readFileSync(TOKEN_FILE, 'utf8').trim();
   if (!token) throw new Error('OneGate agent token empty — refusing to spawn');
   if (!fs.existsSync(CA_HOST_PATH)) {
@@ -103,9 +109,6 @@ export function applyOneGateContainerConfig(args: string[], opts: { agent?: stri
   // The container reaches the Mac host (where the SSH forward listens) via
   // host.docker.internal; the forward tunnels on to the VM's 172.17.0.1:8443.
   const proxyUrl = `http://agent:${token}@host.docker.internal:${port}`;
-
-  // Mount the OneGate root CA read-only. It is a public CA cert, not a secret.
-  args.push('-v', `${CA_HOST_PATH}:${CA_CONTAINER_PATH}:ro`);
 
   // Every TLS connection terminates at the OneGate MITM (OneGate-signed leaves),
   // so the OneGate CA is the correct trust root for SSL_CERT_FILE / DENO_CERT and
@@ -132,14 +135,26 @@ export function applyOneGateContainerConfig(args: string[], opts: { agent?: stri
   const gate = resolveClaudeGateToken();
   env['CLAUDE_CODE_OAUTH_TOKEN'] = gate.token;
 
-  for (const [k, v] of Object.entries(env)) args.push('-e', `${k}=${v}`);
-
   log.info('OneGate proxy env applied', {
     containerName: opts.containerName,
     agent: opts.agent,
     port,
     gateSource: gate.source,
   });
+
+  return {
+    env,
+    // Mount the OneGate root CA read-only. It is a public CA cert, not a secret.
+    mounts: [
+      {
+        class: 'allowlisted-extra',
+        hostPath: CA_HOST_PATH,
+        containerPath: CA_CONTAINER_PATH,
+        mode: 'ro',
+        groupScope: opts.groupScope,
+      },
+    ],
+  };
 }
 
 /**
@@ -158,7 +173,7 @@ export function applyOneGateContainerConfig(args: string[], opts: { agent?: stri
  * has no LLM credential until one is provided. Secret VALUES are never logged,
  * only which source each key came from.
  */
-export function applyDirectContainerConfig(args: string[], opts: { containerName: string }): void {
+export function applyDirectContainerConfig(opts: { containerName: string }): GatewayContribution {
   const injected: Record<string, string> = {};
   const sources: Record<string, string> = {};
 
@@ -202,8 +217,6 @@ export function applyDirectContainerConfig(args: string[], opts: { containerName
     /* no override file — fine */
   }
 
-  for (const [k, v] of Object.entries(injected)) args.push('-e', `${k}=${v}`);
-
   if (Object.keys(injected).length === 0) {
     log.warn('DIRECT mode: no proxy AND no credential found', {
       containerName: opts.containerName,
@@ -214,4 +227,6 @@ export function applyDirectContainerConfig(args: string[], opts: { containerName
       sources,
     });
   }
+
+  return { env: injected };
 }
