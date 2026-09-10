@@ -169,10 +169,22 @@ describe('fork divergence: OneGate proxy switch (behavioral)', () => {
     // typed-spec successor to that ordering trick: contributed mounts always
     // win a containerPath collision, regardless of call order.
     const composed: MountSpec[] = [
-      { class: 'allowlisted-extra', hostPath: '/host/parent', containerPath: '/etc/onegate/rootCA.pem', mode: 'rw', groupScope: 'group-1' },
+      {
+        class: 'allowlisted-extra',
+        hostPath: '/host/parent',
+        containerPath: '/etc/onegate/rootCA.pem',
+        mode: 'rw',
+        groupScope: 'group-1',
+      },
     ];
     const contributed: MountSpec[] = [
-      { class: 'allowlisted-extra', hostPath: '/host/onegate-ca', containerPath: '/etc/onegate/rootCA.pem', mode: 'ro', groupScope: 'group-1' },
+      {
+        class: 'allowlisted-extra',
+        hostPath: '/host/onegate-ca',
+        containerPath: '/etc/onegate/rootCA.pem',
+        mode: 'ro',
+        groupScope: 'group-1',
+      },
     ];
 
     expect(mergeMounts(composed, contributed)).toEqual(contributed);
