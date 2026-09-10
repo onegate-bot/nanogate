@@ -392,10 +392,13 @@ async function testCombinedProviders(skills: RegistrySkill[]): Promise<void> {
     git(['update-ref', 'refs/heads/providers', refs.providers], root);
     git(['remote', 'remove', 'origin'], root);
     git(['remote', 'add', 'skill-ci', '.'], root);
-    const report = await refreshInstalledSkills(root, 'all', {
+    const expected = selected.map(({ provider }) => provider).sort();
+    // Fork: this trunk ships Telegram in-tree (src/channels/telegram.ts), so an
+    // unrestricted refresh also picks up add-telegram and the exact-match below
+    // fails. Refresh only the providers this test installed.
+    const report = await refreshInstalledSkills(root, expected, {
       exec: (cmd, cwd) => command(cmd, cwd),
     });
-    const expected = selected.map(({ provider }) => provider).sort();
     if (JSON.stringify(report.selected) !== JSON.stringify(expected)) {
       throw new Error(`update-skills detected ${report.selected.join(', ') || 'no providers'}`);
     }
