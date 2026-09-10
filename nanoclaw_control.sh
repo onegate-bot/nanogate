@@ -153,7 +153,7 @@ svc_tasks() {
     [[ -n "$out" ]] && body+=$(printf '%s' "$out" | sed "s#^#${name}${US}#")$'\n'
   done
   if [[ "$OUT" == json ]]; then
-    local cnames; cnames=$(docker ps --filter "name=nanoclaw-v2" --format "{{.Names}}${US}{{.Status}}" 2>/dev/null)
+    local cnames; cnames=$(docker ps --filter "label=nanoclaw-session" --format "{{.Names}}${US}{{.Status}}" 2>/dev/null)
     CONTAINERS="$cnames" TASKS="$body" node -e '
       const US="\x1f";
       const parse=(s,keys)=>(s||"").split("\n").filter(Boolean).map(l=>{const f=l.split(US),o={};keys.forEach((k,i)=>o[k]=(f[i]&&f[i].length)?f[i]:null);return o;});
@@ -165,7 +165,7 @@ svc_tasks() {
   echo "Running / queued tasks"
   echo
   echo "Active agent containers:"
-  local c; c=$(docker ps --filter "name=nanoclaw-v2" --format '  {{.Names}}  ({{.Status}})' 2>/dev/null)
+  local c; c=$(docker ps --filter "label=nanoclaw-session" --format '  {{.Names}}  ({{.Status}})' 2>/dev/null)
   [[ -n "$c" ]] && echo "$c" || echo "  (none running — idle)"
   echo
   echo "Pending ad-hoc / one-off tasks (for the recurring schedule, run: $0 crons):"
@@ -231,7 +231,7 @@ svc_health() {
   else hc WARN "OneCLI gateway" "$oc"; fi
 
   # 6. agent containers: thrash + zombies + heartbeat freshness
-  local containers; containers=$(docker ps --filter "name=nanoclaw-v2" --format '{{.Names}}' 2>/dev/null)
+  local containers; containers=$(docker ps --filter "label=nanoclaw-session" --format '{{.Names}}' 2>/dev/null)
   if [[ -z "$containers" ]]; then
     hc OK "agent containers (none running — idle)"
   else
@@ -244,7 +244,7 @@ svc_health() {
       z=$(docker exec "$cn" sh -c 'ps -eo args 2>/dev/null | grep -c "[d]efunct"' 2>/dev/null || echo 0)
       (( z > 3 )) && hc WARN "container $cn zombies" "$z defunct processes (crashed browser tool?)"
       # heartbeat for this container's session
-      folder=$(echo "$cn" | sed -E 's/^nanoclaw-v2-(.*)-[0-9]+$/\1/')
+      folder=$(docker inspect --format '{{index .Config.Labels "nanoclaw-group-folder"}}' "$cn" 2>/dev/null)
       agid=$(q "data/v2.db" "SELECT s.agent_group_id FROM sessions s JOIN agent_groups g ON g.id=s.agent_group_id WHERE g.folder='$folder' LIMIT 1")
       hb=$(ls "$REPO_DIR"/data/v2-sessions/"$agid"/*/.heartbeat 2>/dev/null | head -1)
       if [[ -n "$hb" ]]; then
